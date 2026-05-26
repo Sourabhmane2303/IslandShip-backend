@@ -1,54 +1,71 @@
 /**
- * Island Capture — Multiplayer Server (FIXED)
+ * Island Capture — Multiplayer Server
  * Pure Node.js, zero dependencies
  * Run: node server.js
- * Players share a 6-char room code to join the same game
  *
- * BUGS FIXED:
- *  1. socket.on("game_over") used Socket.IO syntax (io.to / .emit) — replaced
- *     with proper raw-WebSocket relay via broadcast().
- *  2. game_over case body ran CLIENT-side code (G.over, myName, showGameOver)
- *     inside the SERVER switch — replaced with server-side relay logic.
- *  3. game_over case was missing curly braces { } like every other case,
- *     causing fall-through / syntax ambiguity.
- *  4. socket.on("game_over") was placed BETWEEN the data handler and
- *     handleMsg — structurally illegal and never triggered correctly;
- *     moved inside handleMsg switch as a proper case.
- *  5. broadcast() excluded the sender — game_over must go to the OPPONENT,
- *     so excludeRole is correctly set to player.role.
- *  6. payloadLen === 127 read UInt32BE at offset 6 but should start at 2;
- *     fixed to buf.readUInt32BE(2) giving correct 8-byte length.
- *  7. Missing try/catch around JSON.parse — malformed frames crashed server.
- *  8. HTTP handler: fs.readFileSync could throw if index.html missing — wrapped
- *     in try/catch with a clear 500 error response.
- *  9. cleanRooms mutated rooms Map while iterating — converted to Array first.
- * 10. socket.on('error') only called destroy() — added console.error log.
- * 11. player_state spread msg.state into the send object: if state contained
- *     a 'type' key it overwrote 'opponent_state', silently dropping the packet
- *     and freezing the opponent ship. Fixed by nesting as { state: msg.state }.
- * 12. world_state was gated on player.role === 'p1', silently dropping P2's
- *     world updates and freezing pirates/NPCs on P1's screen. Removed the role
- *     guard; now relays bidirectionally to the opponent regardless of role.
- * 13. game_over excluded the sender (excludeRole = player.role), so whichever
- *     player triggered game_over never saw the result on their own screen.
- *     Changed excludeRole to null so both players always receive it.
+ * DEPLOYMENT: Backend on Render, Frontend on Vercel
+ *
+ * Environment variables (set in Render dashboard):
+ *   PORT            — injected automatically by Render (do NOT hardcode)
+ *   ALLOWED_ORIGIN  — your Vercel URL, e.g. https://island-capture.vercel.app
+ *                     Accepts comma-separated list for multiple origins.
+ *                     Defaults to * (all origins) if not set — safe for dev,
+ *                     but always set it in production.
+ *
+ * NOTE (Render free tier): The service spins down after ~15 min of inactivity.
+ * The first WebSocket connection after spin-down will take ~30 s to respond
+ * while Render cold-starts the instance. This is normal on the free plan.
  */
 
 const http   = require('http');
 const crypto = require('crypto');
-const fs     = require('fs');
-const path   = require('path');
 
-const PORT = 3000;
+// ── Config ───────────────────────────────────────────────────
+// Render injects PORT at runtime — never hardcode on Render or the
+// service will bind to the wrong port and fail its health checks.
+const PORT = process.env.PORT || 3000;
 
-// ── Room store ──────────────────────────────────────────────
+// Comma-separated list of allowed origins, e.g.:
+//   ALLOWED_ORIGIN=https://island-capture.vercel.app
+// Leave unset (or set to *) to allow all origins during local dev.
+const RAW_ORIGINS  = (process.env.ALLOWED_ORIGIN || '*').split(',').map(s => s.trim());
+const ALLOW_ALL    = RAW_ORIGINS.includes('*');
+
+function isAllowedOrigin(origin) {
+  if (ALLOW_ALL) return true;
+  if (!origin)   return false;          // no Origin header → reject in prod
+  return RAW_ORIGINS.includes(origin);
+}
+
+// Build the Access-Control-Allow-Origin value for a given request origin.
+// We must echo back the exact origin (not '*') when credentials are involved.
+function corsOriginHeader(reqOrigin) {
+  if (ALLOW_ALL)                      return '*';
+  if (isAllowedOrigin(reqOrigin))     return reqOrigin;
+  return null;   // origin not allowed
+}
+
+// Standard CORS headers added to every HTTP response
+function corsHeaders(reqOrigin) {
+  const origin = corsOriginHeader(reqOrigin);
+  if (!origin) return null;   // caller should respond 403
+  return {
+    'Access-Control-Allow-Origin':      origin,
+    'Access-Control-Allow-Methods':     'GET, OPTIONS',
+    'Access-Control-Allow-Headers':     'Content-Type, Upgrade, Connection, Sec-WebSocket-Key, Sec-WebSocket-Version',
+    'Access-Control-Allow-Credentials': 'true',
+    'Vary':                             'Origin',
+  };
+}
+
+// ── Room store ───────────────────────────────────────────────
 const rooms = new Map();
 
 function genCode() {
   return crypto.randomBytes(3).toString('hex').toUpperCase(); // e.g. "A3F9B2"
 }
 
-// BUG FIX #9 — collect keys into array before deleting during iteration
+// Expire rooms older than 1 hour
 function cleanRooms() {
   const now = Date.now();
   const expired = [];
@@ -62,26 +79,61 @@ function cleanRooms() {
 }
 setInterval(cleanRooms, 5 * 60 * 1000);
 
-// ── HTTP server — serves the game HTML ──────────────────────
-// BUG FIX #8 — wrap readFileSync in try/catch
+// ── HTTP server ──────────────────────────────────────────────
+// Frontend is served by Vercel — this server only handles:
+//   GET /         → health check (Render uses this to verify the service is up)
+//   GET /health   → same health check
+//   OPTIONS *     → CORS preflight
 const server = http.createServer((req, res) => {
-  if (req.url === '/' || req.url === '/index.html') {
-    try {
-      const html = fs.readFileSync(path.join(__dirname, 'index.html'));
-      res.writeHead(200, { 'Content-Type': 'text/html' });
-      res.end(html);
-    } catch (err) {
-      console.error('index.html not found:', err.message);
-      res.writeHead(500, { 'Content-Type': 'text/plain' });
-      res.end('Server error: index.html not found. Place index.html next to server.js');
-    }
-  } else {
-    res.writeHead(404); res.end('Not found');
+  const reqOrigin = req.headers['origin'];
+  const headers   = corsHeaders(reqOrigin);
+
+  // Reject requests from disallowed origins in production
+  if (!headers) {
+    res.writeHead(403, { 'Content-Type': 'text/plain' });
+    res.end(`Origin "${reqOrigin}" not allowed.`);
+    return;
   }
+
+  // Handle CORS preflight
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204, headers);
+    res.end();
+    return;
+  }
+
+  // Health check — Render pings GET / to confirm the service is alive
+  if (req.url === '/' || req.url === '/health') {
+    res.writeHead(200, { ...headers, 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      status: 'ok',
+      service: 'Island Capture Multiplayer Server',
+      rooms: rooms.size,
+      uptime: Math.floor(process.uptime()) + 's',
+    }));
+    return;
+  }
+
+  res.writeHead(404, headers);
+  res.end('Not found');
 });
 
-// ── WebSocket upgrade (pure Node.js, no external library) ───
-server.on('upgrade', (req, socket, head) => {
+// ── WebSocket upgrade ────────────────────────────────────────
+server.on('upgrade', (req, socket) => {
+  const reqOrigin = req.headers['origin'];
+
+  // Validate origin before completing the handshake
+  if (!isAllowedOrigin(reqOrigin)) {
+    console.warn(`[WS] Rejected connection from origin: "${reqOrigin}"`);
+    socket.write(
+      'HTTP/1.1 403 Forbidden\r\n' +
+      'Content-Type: text/plain\r\n\r\n' +
+      `Origin "${reqOrigin}" not allowed.\r\n`
+    );
+    socket.destroy();
+    return;
+  }
+
   const key = req.headers['sec-websocket-key'];
   if (!key) { socket.destroy(); return; }
 
@@ -90,21 +142,23 @@ server.on('upgrade', (req, socket, head) => {
     .update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11')
     .digest('base64');
 
+  // Include CORS headers in the 101 response so browsers accept the upgrade
   socket.write(
     'HTTP/1.1 101 Switching Protocols\r\n' +
     'Upgrade: websocket\r\n' +
     'Connection: Upgrade\r\n' +
-    `Sec-WebSocket-Accept: ${accept}\r\n\r\n`
+    `Sec-WebSocket-Accept: ${accept}\r\n` +
+    `Access-Control-Allow-Origin: ${corsOriginHeader(reqOrigin)}\r\n\r\n`
   );
 
   attachWS(socket);
 });
 
-// ── Per-socket WebSocket handler ────────────────────────────
+// ── Per-socket WebSocket handler ─────────────────────────────
 function attachWS(socket) {
   let player = null; // { code, role: 'p1'|'p2', name }
 
-  // ── Send helper ──────────────────────────────────────────
+  // ── Send helper ────────────────────────────────────────────
   function send(obj) {
     if (socket.destroyed) return;
     try {
@@ -116,12 +170,11 @@ function attachWS(socket) {
       } else if (len < 65536) {
         header = Buffer.from([0x81, 126, (len >> 8) & 0xff, len & 0xff]);
       } else {
-        // BUG FIX #6 — 8-byte extended payload: bytes 2-9, not 6-9
         header = Buffer.from([
           0x81, 127,
           0, 0, 0, 0,
           (len >> 24) & 0xff, (len >> 16) & 0xff,
-          (len >> 8)  & 0xff,  len        & 0xff
+          (len >> 8)  & 0xff,  len        & 0xff,
         ]);
       }
       socket.write(Buffer.concat([header, data]));
@@ -132,7 +185,7 @@ function attachWS(socket) {
 
   socket._sendFn = send;
 
-  // ── Broadcast to all players in a room except excludeRole ─
+  // ── Broadcast to all players in a room (optional role exclude) ──
   function broadcast(room, obj, excludeRole) {
     for (const [role, ws] of Object.entries(room.players)) {
       if (role !== excludeRole && ws && !ws.destroyed) {
@@ -141,7 +194,7 @@ function attachWS(socket) {
     }
   }
 
-  // ── WS frame parser ──────────────────────────────────────
+  // ── WS frame parser ────────────────────────────────────────
   let buf = Buffer.alloc(0);
 
   socket.on('data', chunk => {
@@ -150,12 +203,10 @@ function attachWS(socket) {
     while (buf.length >= 2) {
       const opcode = buf[0] & 0x0f;
 
-      // Close frame
-      if (opcode === 0x8) { socket.destroy(); return; }
+      if (opcode === 0x8) { socket.destroy(); return; }   // close frame
 
-      // Skip non-text / non-binary / non-ping frames
+      // Ignore non-text / non-binary / non-ping frames gracefully
       if (opcode !== 0x1 && opcode !== 0x2 && opcode !== 0x9) {
-        // Just consume — don't crash on ping/pong/continuation
         buf = Buffer.alloc(0); break;
       }
 
@@ -168,7 +219,6 @@ function attachWS(socket) {
         payloadLen = buf.readUInt16BE(2);
         offset = 4;
       } else if (payloadLen === 127) {
-        // BUG FIX #6 — read from offset 2, not 6
         if (buf.length < 10) break;
         payloadLen = buf.readUInt32BE(2) * 0x100000000 + buf.readUInt32BE(6);
         offset = 10;
@@ -191,7 +241,6 @@ function attachWS(socket) {
 
       buf = buf.slice(offset + payloadLen);
 
-      // BUG FIX #7 — wrap JSON.parse in try/catch
       if (opcode === 0x1 || opcode === 0x2) {
         try {
           handleMsg(JSON.parse(payload.toString()));
@@ -202,14 +251,11 @@ function attachWS(socket) {
     }
   });
 
-  // ── Message handler ──────────────────────────────────────
-  // BUG FIX #1 #2 #3 #4 — removed the broken socket.on("game_over") block
-  // that used Socket.IO (io.to/.emit) and client-side vars (G, myName).
-  // game_over is now a proper case inside handleMsg, relaying via broadcast().
+  // ── Message handler ────────────────────────────────────────
   function handleMsg(msg) {
     switch (msg.type) {
 
-      // ── CREATE ROOM ──────────────────────────────────────
+      // ── CREATE ROOM ────────────────────────────────────────
       case 'create_room': {
         const code = genCode();
         const room = {
@@ -226,7 +272,7 @@ function attachWS(socket) {
         break;
       }
 
-      // ── JOIN ROOM ────────────────────────────────────────
+      // ── JOIN ROOM ──────────────────────────────────────────
       case 'join_room': {
         const code = (msg.code || '').toUpperCase().trim();
         const room = rooms.get(code);
@@ -241,24 +287,15 @@ function attachWS(socket) {
         room.players.p2 = socket;
         room.names.p2   = msg.name || 'Captain 2';
         player = { code, role: 'p2', name: room.names.p2 };
-        send({
-          type: 'room_joined', code,
-          role: 'p2', name: player.name,
-          hostName: room.names.p1
-        });
-        // Notify host that guest arrived
+        send({ type: 'room_joined', code, role: 'p2', name: player.name, hostName: room.names.p1 });
         if (room.players.p1) {
-          room.players.p1._sendFn({
-            type: 'opponent_joined',
-            name: room.names.p2,
-            role: 'p2'
-          });
+          room.players.p1._sendFn({ type: 'opponent_joined', name: room.names.p2, role: 'p2' });
         }
         console.log(`[Room ${code}] "${player.name}" joined`);
         break;
       }
 
-      // ── READY (both must confirm before game starts) ─────
+      // ── READY ──────────────────────────────────────────────
       case 'ready': {
         if (!player) return;
         const room = rooms.get(player.code);
@@ -274,21 +311,18 @@ function attachWS(socket) {
         break;
       }
 
-      // ── PLAYER STATE (position, angle, hp, gold, kills) ──
+      // ── PLAYER STATE ──────────────────────────────────────
       case 'player_state': {
         if (!player) return;
         const room = rooms.get(player.code);
         if (!room) return;
         const oppRole = player.role === 'p1' ? 'p2' : 'p1';
         const opp = room.players[oppRole];
-        // BUG FIX #11 — nest state instead of spreading: spreading msg.state
-        // would overwrite type:'opponent_state' if msg.state contains a 'type'
-        // key, causing the client to ignore the packet and freeze the opponent.
         if (opp) opp._sendFn({ type: 'opponent_state', state: msg.state });
         break;
       }
 
-      // ── BULLET FIRED ─────────────────────────────────────
+      // ── BULLET FIRED ──────────────────────────────────────
       case 'bullet': {
         if (!player) return;
         const room = rooms.get(player.code);
@@ -305,40 +339,27 @@ function attachWS(socket) {
         const room = rooms.get(player.code);
         if (!room) return;
         console.log(`[Room ${player.code}] Game over — winner: "${msg.winner}"`);
-        // BUG FIX #13 — broadcast to ALL players (excludeRole = null).
-        // Previously excluded the sender, so if P2 triggered game_over,
-        // P1 never received it (and vice versa). Both players need the
-        // result; each client decides what to show based on msg.winner.
         broadcast(room, {
           type:   'game_over',
           winner: msg.winner,
-          stats:  msg.stats || {}
+          loser:  msg.loser,   // true = recipient lost, false = recipient won
+          stats:  msg.stats || {},
         }, null);
         break;
       }
 
-      // ── WORLD STATE (host → guest: isles + ships) ────────
-      // BUG FIX #12 — relay bidirectionally, not just P1→P2.
-      // Restricting to player.role === 'p1' meant P2's world updates were
-      // silently dropped, freezing pirates and NPC ships on P1's screen.
+      // ── WORLD STATE ───────────────────────────────────────
       case 'world_state': {
         if (!player) return;
         const room = rooms.get(player.code);
         if (!room) return;
-        // Send to the opponent regardless of who is P1 or P2
         const oppRole = player.role === 'p1' ? 'p2' : 'p1';
         const opp = room.players[oppRole];
-        if (opp) {
-          opp._sendFn({
-            type:  'world_state',
-            isles: msg.isles,
-            ships: msg.ships
-          });
-        }
+        if (opp) opp._sendFn({ type: 'world_state', isles: msg.isles, ships: msg.ships });
         break;
       }
 
-      // ── GAME EVENT (capture / sink log messages) ──────────
+      // ── GAME EVENT ────────────────────────────────────────
       case 'game_event': {
         if (!player) return;
         const room = rooms.get(player.code);
@@ -347,17 +368,16 @@ function attachWS(socket) {
         break;
       }
 
-      // ── CHAT ─────────────────────────────────────────────
+      // ── CHAT ──────────────────────────────────────────────
       case 'chat': {
         if (!player) return;
         const room = rooms.get(player.code);
         if (!room) return;
-        // Broadcast to all (including sender so they see their own msg)
         broadcast(room, { type: 'chat', from: player.name, text: msg.text }, null);
         break;
       }
 
-      // ── PING ─────────────────────────────────────────────
+      // ── PING ──────────────────────────────────────────────
       case 'ping': {
         send({ type: 'pong', t: msg.t });
         break;
@@ -368,7 +388,7 @@ function attachWS(socket) {
     }
   }
 
-  // ── Disconnect ───────────────────────────────────────────
+  // ── Disconnect ─────────────────────────────────────────────
   socket.on('close', () => {
     if (!player) return;
     const room = rooms.get(player.code);
@@ -379,27 +399,31 @@ function attachWS(socket) {
     const oppRole = player.role === 'p1' ? 'p2' : 'p1';
     const opp = room.players[oppRole];
     if (opp) opp._sendFn({ type: 'opponent_left', name: player.name });
-    // Clean up if both gone
     if (!room.players.p1 && !room.players.p2) {
       rooms.delete(player.code);
       console.log(`[Room ${player.code}] Empty, removed`);
     }
   });
 
-  // BUG FIX #10 — log the error before destroying
   socket.on('error', (err) => {
     console.error(`Socket error (${player?.name || 'unknown'}):`, err.message);
     socket.destroy();
   });
 }
 
-// ── Start ────────────────────────────────────────────────────
+// ── Start ─────────────────────────────────────────────────────
 server.listen(PORT, () => {
+  const origins = ALLOW_ALL ? '* (all — set ALLOWED_ORIGIN in production!)' : RAW_ORIGINS.join(', ');
   console.log(`\n⚓  Island Capture Multiplayer Server`);
-  console.log(`   http://localhost:${PORT}`);
+  console.log(`   Listening on port ${PORT}`);
+  console.log(`   Allowed origins: ${origins}`);
+  console.log(`\n   RENDER DEPLOYMENT CHECKLIST:`);
+  console.log(`   ✓ Set ALLOWED_ORIGIN = https://<your-app>.vercel.app`);
+  console.log(`   ✓ PORT is injected by Render automatically — do not override`);
+  console.log(`   ✓ Update the WS URL in island-capture.html to wss://<your-render-app>.onrender.com`);
   console.log(`\n   HOW TO PLAY:`);
-  console.log(`   1. Open http://localhost:${PORT} in Browser Tab 1`);
-  console.log(`   2. Click "Create Room" — note the 6-letter code`);
-  console.log(`   3. Open http://localhost:${PORT} in Browser Tab 2`);
-  console.log(`   4. Enter the code and click "Join Room"\n`);
+  console.log(`   1. Open your Vercel URL in Browser Tab 1`);
+  console.log(`   2. Click "Multiplayer" → enter name → "Create Room" → note the code`);
+  console.log(`   3. Share the code with your opponent`);
+  console.log(`   4. Opponent opens Vercel URL → "Multiplayer" → enters code → "Join Room"\n`);
 });
